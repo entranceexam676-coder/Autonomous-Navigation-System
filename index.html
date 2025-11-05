@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autonomous Vehicle Road Navigation</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css">
+  <style>
+    body, html {
+      margin: 0;
+      height: 100%;
+      font-family: 'Inter', sans-serif;
+      background: #06121f;
+      color: #fff;
+    }
+    #map { height: 100%; width: 100%; }
+    #panel {
+      position: fixed;
+      top: 20px; left: 20px;
+      width: 320px;
+      background: rgba(10,20,40,0.9);
+      border-radius: 12px;
+      box-shadow: 0 8px 25px rgba(0,0,0,0.5);
+      padding: 18px;
+      backdrop-filter: blur(6px);
+      z-index: 999;
+    }
+    h3 { margin: 0 0 8px 0; color: #18a0fb; }
+    select, input, button {
+      width: 100%;
+      padding: 8px;
+      border: none;
+      border-radius: 6px;
+      margin-top: 6px;
+      background: rgba(255,255,255,0.1);
+      color: #fff;
+      font-size: 14px;
+    }
+    button {
+      background: #18a0fb;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover { background: #0b8fe4; }
+    .toggle {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 10px;
+      font-size: 13px;
+    }
+    .stats {
+      margin-top: 10px;
+      padding: 10px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 8px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="panel">
+    <h3>Autonomous Vehicle Navigation</h3>
+    <label>Vehicle:</label>
+   <select id="vehicleSelect" style=" background-color: #ffffff; color: #050505;"></select>
+
+    <div style="display:flex;gap:6px;">
+      <input type="text" id="newVehicle" placeholder="Enter vehicle name">
+      <button onclick="addVehicle()">+</button>
+    </div>
+    <button onclick="deleteVehicle()">Delete Vehicle</button>
+    <p style="font-size:13px;">Click two points on map to set Start and Destination.</p>
+    <button onclick="startRoute()">Start Navigation</button>
+    <div class="toggle">
+      <input type="checkbox" id="trafficToggle" onchange="toggleTraffic()"> Live Road Data (Traffic)
+    </div>
+    <div class="stats">
+      <div>Distance Traveled: <span id="dist">0.00 km</span></div>
+      <div>Total Distance: <span id="totalDist">0.00 km</span></div>
+      <div>Estimated Time: <span id="time">0 Min</span></div>
+      <div>Traffic: <span id="trafficStatus" style="color:#3cb371">Clear</span></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map').setView([19.076, 72.8777], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+    let startMarker, endMarker, carMarker;
+    let altRoutes = [], bestRouteLine = null, routeCoords = [];
+    let moveInterval = null, trafficInterval = null;
+    let distanceTraveled = 0, totalDistance = 0;
+    const roadLayer = L.layerGroup().addTo(map);
+
+    const carIcon = L.icon({ iconUrl: "https://cdn-icons-png.flaticon.com/512/744/744465.png", iconSize: [36, 36] });
+    loadVehicles();
+
+    map.on('click', e => {
+      if (!startMarker) {
+        startMarker = L.marker(e.latlng).addTo(map).bindPopup("Start Point").openPopup();
+      } else if (!endMarker) {
+        endMarker = L.marker(e.latlng).addTo(map).bindPopup("Destination").openPopup();
+        fetchRoutes();
+      }
+    });
+
+    function loadVehicles() {
+      const sel = document.getElementById("vehicleSelect");
+      const list = JSON.parse(localStorage.getItem("vehicles")) || ["Tesla Model X"];
+      sel.innerHTML = "";
+      list.forEach(v => {
+        const opt = document.createElement("option");
+        opt.text = v;
+        sel.add(opt);
+      });
+      localStorage.setItem("vehicles", JSON.stringify(list));
+    }
+
+    function addVehicle() {
+      const name = document.getElementById("newVehicle").value.trim();
+      if (!name) return alert("Enter vehicle name");
+      const list = JSON.parse(localStorage.getItem("vehicles")) || [];
+      list.push(name);
+      localStorage.setItem("vehicles", JSON.stringify(list));
+      loadVehicles();
+      document.getElementById("newVehicle").value = "";
+    }
+
+    function deleteVehicle() {
+      const sel = document.getElementById("vehicleSelect").value;
+      let list = JSON.parse(localStorage.getItem("vehicles")) || [];
+      list = list.filter(v => v !== sel);
+      localStorage.setItem("vehicles", JSON.stringify(list));
+      loadVehicles();
+    }
+
+    // Fetch multiple alternate routes
+    function fetchRoutes() {
+      const s = startMarker.getLatLng(), t = endMarker.getLatLng();
+      const url = `https://router.project-osrm.org/route/v1/driving/${s.lng},${s.lat};${t.lng},${t.lat}?alternatives=true&overview=full&geometries=geojson`;
+      fetch(url)
+        .then(res => res.json())
+        .then(data => {
+          if (data.routes.length === 0) return alert("No route found!");
+          altRoutes.forEach(r => map.removeLayer(r));
+          if (bestRouteLine) map.removeLayer(bestRouteLine);
+          altRoutes = [];
+          let best = data.routes[0];
+          let minDist = best.distance;
+
+          data.routes.forEach((r, i) => {
+            const coords = r.geometry.coordinates.map(c => [c[1], c[0]]);
+            const color = i === 0 ? '#18a0fb' : i === 1 ? '#ffb703' : '#aaa';
+            const line = L.polyline(coords, { color, weight: i === 0 ? 6 : 4, opacity: 0.7 }).addTo(map);
+            altRoutes.push(line);
+            line.on('click', () => selectRoute(coords, line));
+            if (r.distance < minDist) { minDist = r.distance; best = r; }
+          });
+
+          routeCoords = best.geometry.coordinates.map(c => [c[1], c[0]]);
+          totalDistance = best.distance / 1000;
+          document.getElementById("totalDist").innerText = totalDistance.toFixed(2) + " km";
+          document.getElementById("time").innerText = Math.ceil(totalDistance / 0.8) + " min";
+          bestRouteLine = L.polyline(routeCoords, { color: '#18a0fb', weight: 6 }).addTo(map);
+          map.fitBounds(bestRouteLine.getBounds());
+          if (carMarker) map.removeLayer(carMarker);
+          carMarker = L.marker(routeCoords[0], { icon: carIcon }).addTo(map);
+          drawRoadTraffic();
+        });
+    }
+
+    function selectRoute(coords, poly) {
+      altRoutes.forEach(p => p.setStyle({ opacity: 0.3, weight: 4 }));
+      poly.setStyle({ opacity: 1, weight: 6, color: '#18a0fb' });
+      routeCoords = coords;
+      if (bestRouteLine) map.removeLayer(bestRouteLine);
+      bestRouteLine = poly;
+      if (carMarker) carMarker.setLatLng(coords[0]);
+      map.fitBounds(poly.getBounds());
+    }
+
+    // Simulate full city road traffic
+    function drawRoadTraffic() {
+      roadLayer.clearLayers();
+      if (!routeCoords.length) return;
+      for (let i = 0; i < routeCoords.length - 1; i++) {
+        const start = routeCoords[i];
+        const end = routeCoords[i + 1];
+        const color = randomTrafficColor();
+        L.polyline([start, end], { color, weight: 4, opacity: 0.7 }).addTo(roadLayer);
+      }
+    }
+
+    function randomTrafficColor() {
+      const r = Math.random();
+      if (r < 0.6) return "green";
+      if (r < 0.85) return "yellow";
+      return "red";
+    }
+
+    function startRoute() {
+      if (!routeCoords.length) return alert("Select start/destination first.");
+      let i = 0;
+      distanceTraveled = 0;
+      const distEl = document.getElementById("dist"), trafficEl = document.getElementById("trafficStatus");
+      if (moveInterval) clearInterval(moveInterval);
+      moveInterval = setInterval(() => {
+        if (i < routeCoords.length - 1) {
+          const curr = L.latLng(routeCoords[i]);
+          const next = L.latLng(routeCoords[i + 3] || routeCoords[i + 1]);
+          const d = curr.distanceTo(next) / 1000;
+          distanceTraveled += d;
+          distEl.innerText = distanceTraveled.toFixed(2) + " km";
+          carMarker.setLatLng(next);
+          updateTrafficStatus(next, trafficEl);
+          i += 3;
+        } else {
+          clearInterval(moveInterval);
+          trafficEl.innerText = "Reached";
+          trafficEl.style.color = "#18a0fb";
+          alert("Destination reached!");
+        }
+      }, 150);
+    }
+
+    function toggleTraffic() {
+      const on = document.getElementById("trafficToggle").checked;
+      if (on) {
+        trafficInterval = setInterval(drawRoadTraffic, 4000);
+      } else {
+        clearInterval(trafficInterval);
+        drawRoadTraffic();
+      }
+    }
+
+    function updateTrafficStatus(pos, el) {
+      let nearbyRed = false;
+      roadLayer.eachLayer(line => {
+        const latlngs = line.getLatLngs();
+        for (let j = 0; j < latlngs.length - 1; j++) {
+          const mid = latlngs[j];
+          if (pos.distanceTo(mid) < 200 && line.options.color === "red") {
+            nearbyRed = true;
+            break;
+          }
+        }
+      });
+      if (nearbyRed) {
+        el.innerText = "Heavy";
+        el.style.color = "#ff3b3b";
+      } else {
+        el.innerText = "Clear";
+        el.style.color = "#3cb371";
+      }
+    }
+  </script>
+</body>
+</html>
